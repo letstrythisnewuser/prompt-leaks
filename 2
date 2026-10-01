@@ -1,0 +1,113 @@
+while
+  the room has players; ticks never overlap — a slow one delays the next).
+  Broadcasting every player to every player is N² per tick: fine for a few
+  dozen players; past that send only what changed, or only what's near each
+  player via `conn.send`.
+- Messages are strings on the wire (max 64 KB); `send`/`broadcast` accept
+  objects and JSON-stringify them.
+
+### Room rules
+
+- The live site runs the published `server.js`; a preview runs your
+  workspace `server.js` in a separate draft room (editors only) — the same
+  split as `/api`.
+- **The room restarts** when you publish (the draft room: on the next preview
+  reload after a save), and occasionally on its own (a redeploy of the
+  platform, memory pressure).
+  A restart means: in-memory state is gone, every client's socket closes and
+  reconnects automatically, the client sees `onreconnect`, and your
+  handlers get a fresh `onConnect` for each player. `env.DB` survives.
+  Design for it: keep state that must survive in `env.DB`, and let clients
+  re-send their setup on `onreconnect`. Do NOT respond by moving hot state
+  into the database.
+- Finish your work before the handler returns: `await` everything, and don't
+  call `conn`/`room` from a `setTimeout` after returning (use `onTick`
+  for anything delayed or periodic).
+- Handlers interleave at `await`s (two players' messages, or a message and
+  a tick), and two messages from the same player can complete out of order
+  if the first awaits. Synchronous updates to in-memory state are safe; for
+  `env.DB` read-modify-write use one atomic statement (`UPDATE score SET
+  points = points + 1 WHERE ...`) rather than read, compute, write.
+- Limits: 200 connections; above ~120 messages/second per connection extra
+  frames are dropped. Every message is one dispatch into your `server.js`
+  on a single-threaded room, which handles on the order of a thousand per
+  second — so send inputs at 10–20 Hz and let `onTick` broadcast, rather
+  than one message per mousemove pixel.
+
+## Tips
+
+- The server is the authority: validate every input and derive anything
+  security-relevant (user identity, high scores, vote counts) on the server,
+  never trust values computed on the client.
+- Keep responses small and fast; do pagination with `LIMIT`/`OFFSET`.
+- For live multiplayer, use the room (above). For slowly-changing shared data
+  (leaderboards, feeds), plain `/api` routes + polling are simpler and fine.
+- Errors thrown in `server.js` return a 500 with the error message in the
+  JSON body — read it when debugging a failing route. Errors thrown in room
+  handlers land in the same backend logs, as does a `server.js` that fails
+  to load (every join is refused until it is fixed) and any `send` /
+  `broadcast` the room refused to deliver (for example over the 64 KB
+  limit): if players "can't connect" or a message never arrives, search the
+  logs before changing game code.
+
+</websim-backend-documentation>
+
+# Working on the backend in this sandbox
+
+- The preview RUNS `server.js` for real: every `/api/*` request executes
+  your draft in the SAME Cloudflare Workers runtime the published site uses,
+  with the same capabilities — `env.DB` is the project's REAL database (rows
+  you write while testing are live data), `env.AI` is real inference,
+  `env.BLOB` really uploads. What works in the preview works published.
+  Saving `server.js` takes effect on the next request; no restart step.
+- A fresh project's backend becomes available after the first publish; a
+  `/api/*` call before that returns an explanatory error — publish once and
+  retry rather than debugging it.
+- The realtime room follows the same rule: the preview runs your workspace
+  `server.js` room handlers in a draft room (a save takes effect on the next
+  preview reload); the live site runs the published ones. Publishing restarts
+  the live room (players reconnect automatically; `env.DB` survives,
+  in-memory handler state does not). Room handler errors and console output
+  appear in `logs` like any other backend code.
+- A `db` command is installed for inspecting and fixing the database
+  directly — the same database `env.DB` reaches, so use it to check schema,
+  seed rows, or debug what a route actually wrote:
+
+  ```
+  db "SELECT name FROM sqlite_master WHERE type='table'"
+  db "SELECT * FROM scores ORDER BY points DESC LIMIT 10"
+  db "DELETE FROM scores WHERE user_id = ?" -- alice
+  db --exec "CREATE TABLE IF NOT EXISTS scores (id INTEGER PRIMARY KEY)"
+  ```
+
+  Bound params follow `--` (numeric-looking values bind as numbers,
+  `null` as NULL). Output is JSON. Remember it is LIVE project data, not a
+  scratch copy.
+- A `logs` command searches the server-side logs of `server.js` — console
+  output, uncaught exceptions with stack traces, and one line per request —
+  covering published `/api/*` traffic AND your own preview runs. When a
+  route 500s without a useful body, this is where the real error is:
+
+  ```
+  logs                          # last hour
+  logs --since 15m --level error
+  logs --search "TypeError"
+  logs --json                   # structured entries for piping
+  ```
+
+  Entries appear a few seconds after the request, so make the failing
+  request first, then run `logs`.
+- When the creator reports a broken `/api/*` route, reproduce it BEFORE
+  changing code: send the same request with the real inputs from the shell
+  and read the whole response body, then check `logs`. The body names the
+  actual failure; the page usually shows only a summary of it.
+
+  ```
+  curl -sS -i -X POST http://localhost:8081/api/route -H 'content-type: application/json' --data '{"the":"real input"}'
+  ```
+
+  Fix only the failure you observed, then rerun that same request and
+  confirm the body is what the page expects. A mocked run, a syntax check,
+  or a deliberately invalid request that returns some other error is not
+  evidence that the creator's interaction works. If an outbound provider
+  call is involved, one real call is worth more than any amount of reading.
