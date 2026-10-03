@@ -12,3 +12,131 @@ Rules you must follow:
 - Only answer questions and give clear explanations. Do not perform actions, execute things, or generate files.
 - Keep answers concise, clear, and conversational.
 - If you don't know something about Websim, say so honestly rather than guessing.
+Every user's avatar is served at
+`https://images.websim.com/avatar/${username}` — nothing to store or
+generate. Wherever the UI shows a username (leaderboards, comment lists,
+chat), render this avatar next to it; names with faces are the websim
+convention and make user-generated lists feel alive.
+
+## Attribute every row to its author — REQUIRED
+
+Every table that stores visitor-created or visitor-submitted data (scores,
+posts, comments, votes, saves, messages, uploads — anything a request wrote)
+**must** include a `user_id TEXT` column holding the visitor's
+`x-websim-user-id`, including when you also store `username` for display.
+Do this even for tables where per-user lookup isn't needed.
+
+This is a moderation contract, not a style preference: when a user is banned
+from this project or from websim entirely, **the platform automatically
+deletes every row whose `user_id` column matches theirs, in every table that
+has one**. A table without `user_id` cannot be cleaned up, so a banned
+user's spam or abuse would stay in the project forever. Consequences:
+
+- Name the column exactly `user_id` (not `author_id`, `owner`, `uid`).
+  Rows the platform should never delete (project config, aggregate counters,
+  content created by `server.js` itself) belong in tables WITHOUT a
+  `user_id` column.
+- Store denormalized `username` only alongside `user_id` in the same row,
+  so it disappears with the row.
+- Don't write signed-out visitors' content into durable tables — there is no
+  id to attribute it to, so it can never be scrubbed. Require sign-in for
+  writes (as the example below does), or keep anonymous input ephemeral.
+- Expect attributed rows to vanish: don't make other users' data reference a
+  row in a way that breaks hard when it's deleted.
+
+## env.DB — the project's private SQLite database
+
+`env.DB` is a SQLite database that belongs to this project alone. It follows
+the Cloudflare D1 API for the methods listed here — `prepare`, `bind`,
+`all`, `first`, `run`, `raw`, `batch`, and `exec`. Other D1 methods
+(`withSession`, `dump`) do not exist, and `meta.duration` is always 0.
+
+```js
+// Read many rows
+const { results } = await env.DB
+  .prepare("SELECT * FROM scores WHERE game = ? ORDER BY points DESC LIMIT 10")
+  .bind("main")
+  .all();
+
+// Read one row (or one column of it)
+const row = await env.DB.prepare("SELECT * FROM scores WHERE user_id = ?").bind(userId).first();
+const best = await env.DB.prepare("SELECT MAX(points) AS p FROM scores").first("p");
+
+// Write
+const { meta } = await env.DB
+  .prepare("INSERT INTO scores (user_id, points) VALUES (?, ?)")
+  .bind(userId, 42)
+  .run();
+// meta.last_row_id, meta.changes
+
+// Several writes, all-or-nothing (one transaction)
+await env.DB.batch([
+  env.DB.prepare("INSERT INTO scores (user_id, points) VALUES (?, ?)").bind(userId, 42),
+  env.DB.prepare("UPDATE totals SET plays = plays + 1 WHERE id = ?").bind(userId),
+]);
+
+```
+
+Tables: export your schema and it is applied once, before the first request
+or room event — no CREATE TABLE in handlers.
+
+```js
+export const schema = `
+  CREATE TABLE IF NOT EXISTS scores (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, points INTEGER);
+  CREATE INDEX IF NOT EXISTS scores_user ON scores (user_id);
+`;
+```
+
+- SQLite dialect (not Postgres): `INTEGER PRIMARY KEY AUTOINCREMENT`,
+  `TEXT`, `REAL`, `BLOB`; `?` placeholders via `.bind()`. Always use
+  `.bind()` for values — never interpolate strings into SQL.
+- `schema` must be idempotent (`IF NOT EXISTS`): it runs on every cold
+  start against a database that already has your tables.
+- The database **persists across edits and new versions** of the project. A
+  remix/fork of the project starts with its own empty database. No other
+  project can ever read it.
+- There is a size limit (512 MB). Writes past it fail while reads and deletes
+  keep working, so store URLs and ids rather than large blobs — put the bytes
+  in `env.BLOB`.
+- File bytes cannot go in the database at all: each bound parameter is capped
+  at 128 KB (blob bytes or string characters) and SQL text at 100 KB, so
+  images/audio/video — raw or base64 — are refused. Store them with
+  `env.BLOB.put()` and save the returned URL in the database.
+- String values being written pass a profanity filter and are stored with any
+  flagged words censored (`***`); don't rely on written text coming back
+  byte-for-byte identical.
+
+## env.AI — websim-hosted inference (no API keys)
+
+Server-side AI without any provider account or key:
+
+```js
+// Chat completion (fast general model). Returns { content: string }.
+const { content } = await env.AI.chat({
+  messages: [
+    { role: "system", content: "You are a pirate. Answer in one sentence." },
+    { role: "user", content: userQuestion },
+  ],
+});
+
+// Ask for JSON and get a parseable string back
+const { content: jsonText } = await env.AI.chat({
+  messages: [{ role: "user", content: "List 3 fruits as a JSON array" }],
+  json: true,
+});
+const fruits = JSON.parse(jsonText);
+
+// Image generation. Returns { url } — a permanent public image URL.
+const { url } = await env.AI.generateImage({
+  prompt: "a watercolor fox, minimalist",
+  aspectRatio: "1:1", // optional; also accepts width/height, seed, transparent
+});
+```
+
+- Use `env.AI` for server-authoritative AI (NPC turns, judging submissions,
+  content that must be generated once and shared). For purely client-side AI
+  chat, the `window.websim` client API is still the simplest path.
+- Prompts pass content moderation, and calls are rate limited per visitor, per
+  project, and per project per day — image generation much more tightly than
+  chat. Treat a rate-limit error as expected: catch it and return a useful
+  message rather than letting the route 500. Never call `env.AI` in a loop
